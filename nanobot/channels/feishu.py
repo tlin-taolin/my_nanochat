@@ -1,13 +1,15 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
+from __future__ import annotations
+
 import asyncio
+import importlib.util
 import json
 import os
 import re
 import threading
 from collections import OrderedDict
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -17,7 +19,8 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import FeishuConfig
 
-import importlib.util
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
@@ -246,13 +249,25 @@ class FeishuChannel(BaseChannel):
     name = "feishu"
     display_name = "Feishu"
 
-    def __init__(self, config: FeishuConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: FeishuConfig,
+        bus: MessageBus,
+        groq_api_key: str = "",
+        provider: LLMProvider | None = None,
+    ):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
+        self.groq_api_key = groq_api_key
+        self.provider = provider
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        # Short-term group context: chat_id -> [last_5_messages]
+        self._group_context: dict[str, list[str]] = {}
+        # Bot's own message IDs in groups: chat_id -> set(last_20_msg_ids)
+        self._bot_message_ids: dict[str, set[str]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @staticmethod
@@ -315,6 +330,7 @@ class FeishuChannel(BaseChannel):
         # "This event loop is already running" errors.
         def run_ws():
             import time
+
             import lark_oapi.ws.client as _lark_ws_client
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
@@ -352,30 +368,13 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
-    def _is_bot_mentioned(self, message: Any) -> bool:
-        """Check if the bot is @mentioned in the message."""
-        raw_content = message.content or ""
-        if "@_all" in raw_content:
-            return True
-
-        for mention in getattr(message, "mentions", None) or []:
-            mid = getattr(mention, "id", None)
-            if not mid:
-                continue
-            # Bot mentions have no user_id (None or "") but a valid open_id
-            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
-                return True
-        return False
-
-    def _is_group_message_for_bot(self, message: Any) -> bool:
-        """Allow group messages when policy is open or bot is @mentioned."""
-        if self.config.group_policy == "open":
-            return True
-        return self._is_bot_mentioned(message)
-
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
-        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+            Emoji,
+        )
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -774,9 +773,8 @@ class FeishuChannel(BaseChannel):
                     None, self._download_file_sync, message_id, file_key, msg_type
                 )
                 if not filename:
-                    filename = file_key[:16]
-                if msg_type == "audio" and not filename.endswith(".opus"):
-                    filename = f"{filename}.opus"
+                    ext = {"audio": ".opus", "media": ".mp4"}.get(msg_type, "")
+                    filename = f"{file_key[:16]}{ext}"
 
         if data and filename:
             file_path = media_dir / filename
@@ -786,31 +784,54 @@ class FeishuChannel(BaseChannel):
 
         return None, f"[{msg_type}: download failed]"
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
-        """Send a single message (text/image/file/interactive) synchronously."""
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    def _send_message_sync(
+        self, receive_id_type: str, receive_id: str, msg_type: str, content: str,
+        reply_to_message_id: str | None = None
+    ) -> str | None:
+        """Send a single message. Returns message_id if successful."""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+            ReplyMessageRequest,
+            ReplyMessageRequestBody,
+        )
         try:
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(receive_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
-            response = self._client.im.v1.message.create(request)
+            if reply_to_message_id:
+                request = ReplyMessageRequest.builder() \
+                    .message_id(reply_to_message_id) \
+                    .request_body(
+                        ReplyMessageRequestBody.builder()
+                        .msg_type(msg_type)
+                        .content(content)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.reply(request)
+            else:
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(receive_id)
+                        .msg_type(msg_type)
+                        .content(content)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.create(request)
+
             if not response.success():
+                op = "reply to" if reply_to_message_id else "send"
                 logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
+                    "Failed to {} Feishu {} message: code={}, msg={}, log_id={}",
+                    op, msg_type, response.code, response.msg, response.get_log_id()
                 )
-                return False
-            logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
-            return True
+                return None
+            msg_id = response.data.message_id
+            logger.debug("Feishu {} message sent to {}, id={}", msg_type, receive_id, msg_id)
+            return msg_id
         except Exception as e:
-            logger.error("Error sending Feishu {} message: {}", msg_type, e)
-            return False
+            op = "replying to" if reply_to_message_id else "sending"
+            logger.error("Error {} Feishu {} message: {}", op, msg_type, e)
+            return None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -822,60 +843,89 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
-            for file_path in msg.media:
-                if not os.path.isfile(file_path):
+            reply_to_message_id = None
+            if self.config.reply_to_message:
+                reply_to_message_id = msg.metadata.get("message_id")
+
+            sent_msg_ids = []
+
+            for file_path in (msg.media or []):
+                if not os.path.exists(file_path):
                     logger.warning("Media file not found: {}", file_path)
                     continue
+
                 ext = os.path.splitext(file_path)[1].lower()
+                mid = None
                 if ext in self._IMAGE_EXTS:
-                    key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
-                    if key:
-                        await loop.run_in_executor(
+                    image_key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                    if image_key:
+                        mid = await loop.run_in_executor(
                             None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
+                            receive_id_type, msg.chat_id, "image", json.dumps({"image_key": image_key}),
+                            reply_to_message_id
                         )
                 else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
-                    if key:
-                        # Use msg_type "media" for audio/video so users can play inline;
-                        # "file" for everything else (documents, archives, etc.)
-                        if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
-                            media_type = "media"
-                        else:
-                            media_type = "file"
-                        await loop.run_in_executor(
+                    file_key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                    if file_key:
+                        msg_type = "audio" if ext in self._AUDIO_EXTS else "media" if ext in self._VIDEO_EXTS else "file"
+                        mid = await loop.run_in_executor(
                             None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                            receive_id_type, msg.chat_id, msg_type, json.dumps({"file_key": file_key}),
+                            reply_to_message_id
                         )
+                if mid:
+                    sent_msg_ids.append(mid)
 
             if msg.content and msg.content.strip():
+                # Update context history with bot's own reply
+                if msg.chat_id.startswith("oc_"): # It's a group
+                    if msg.chat_id not in self._group_context:
+                        self._group_context[msg.chat_id] = []
+                    self._group_context[msg.chat_id].append(f"You: {msg.content[:300]}")
+                    if len(self._group_context[msg.chat_id]) > 5:
+                        self._group_context[msg.chat_id].pop(0)
+
                 fmt = self._detect_msg_format(msg.content)
 
                 if fmt == "text":
-                    # Short plain text – send as simple text message
                     text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(
+                    mid = await loop.run_in_executor(
                         None, self._send_message_sync,
                         receive_id_type, msg.chat_id, "text", text_body,
+                        reply_to_message_id
                     )
+                    if mid: sent_msg_ids.append(mid)
 
                 elif fmt == "post":
-                    # Medium content with links – send as rich-text post
                     post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(
+                    mid = await loop.run_in_executor(
                         None, self._send_message_sync,
                         receive_id_type, msg.chat_id, "post", post_body,
+                        reply_to_message_id
                     )
+                    if mid: sent_msg_ids.append(mid)
 
                 else:
-                    # Complex / long content – send as interactive card
                     elements = self._build_card_elements(msg.content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
+                        mid = await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                            reply_to_message_id
                         )
+                        if mid: sent_msg_ids.append(mid)
+
+            # Store bot message IDs for later reply detection
+            if sent_msg_ids and msg.chat_id.startswith("oc_"):
+                if msg.chat_id not in self._bot_message_ids:
+                    self._bot_message_ids[msg.chat_id] = set()
+                for mid in sent_msg_ids:
+                    self._bot_message_ids[msg.chat_id].add(mid)
+                # Keep only last 50 IDs to prevent memory leak
+                if len(self._bot_message_ids[msg.chat_id]) > 50:
+                    # Remove some old ones (simple way)
+                    self._bot_message_ids[msg.chat_id] = set(list(self._bot_message_ids[msg.chat_id])[-50:])
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
@@ -887,6 +937,33 @@ class FeishuChannel(BaseChannel):
         """
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+
+    def _get_message_content_sync(self, message_id: str) -> str | None:
+        """Fetch message content from Feishu by message_id."""
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                logger.warning("Failed to fetch message {}: code={}, msg={}", message_id, response.code, response.msg)
+                return None
+
+            msg_data = response.data.items[0]
+            m_type = msg_data.msg_type
+            try:
+                c_json = json.loads(msg_data.content)
+            except json.JSONDecodeError:
+                return None
+
+            if m_type == "text":
+                return c_json.get("text")
+            elif m_type == "post":
+                return _extract_post_text(c_json)
+            else:
+                return MSG_TYPE_MAP.get(m_type, f"[{m_type}]")
+        except Exception as e:
+            logger.warning("Error fetching message {}: {}", message_id, e)
+            return None
 
     async def _on_message(self, data: Any) -> None:
         """Handle incoming message from Feishu."""
@@ -913,10 +990,6 @@ class FeishuChannel(BaseChannel):
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
-
-            if chat_type == "group" and not self._is_group_message_for_bot(message):
-                logger.debug("Feishu: skipping group message (not mentioned)")
-                return
 
             # Add reaction
             await self._add_reaction(message_id, self.config.react_emoji)
@@ -953,6 +1026,7 @@ class FeishuChannel(BaseChannel):
                 if file_path:
                     media_paths.append(file_path)
 
+                # Transcribe audio using Groq Whisper
                 if msg_type == "audio" and file_path:
                     transcription = await self.transcribe_audio(file_path)
                     if transcription:
@@ -974,6 +1048,70 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
+            # Quoted content handling (replies)
+            quoted_content = None
+            parent_id = getattr(message, "parent_id", None)
+            if parent_id:
+                loop = asyncio.get_running_loop()
+                quoted_content = await loop.run_in_executor(None, self._get_message_content_sync, parent_id)
+
+            # Smart reply logic for groups
+            if chat_type == "group":
+                # Update context cache
+                if chat_id not in self._group_context:
+                    self._group_context[chat_id] = []
+
+                context_history = list(self._group_context[chat_id])
+
+                is_mentioned = False
+                # 1. Check if bot is explicitly mentioned in mentions list
+                if hasattr(message, "mentions") and message.mentions:
+                    for mention in message.mentions:
+                        if mention.id.open_id == sender_id: # sender is bot
+                            continue
+                        is_mentioned = True
+                        break
+
+                # 2. Check if this is a direct reply to one of the bot's messages
+                parent_id = getattr(message, "parent_id", None)
+                if not is_mentioned and parent_id:
+                    bot_msgs = self._bot_message_ids.get(chat_id, set())
+                    if parent_id in bot_msgs:
+                        logger.debug("Direct reply to bot message detected, bypassing semantic check")
+                        is_mentioned = True
+
+                # 3. Check for keywords/semantics if not mentioned/replied
+                if not is_mentioned and not self.config.reply_all:
+                    triggered = False
+                    # Check keywords
+                    for kw in self.config.reply_keywords:
+                        if kw.lower() in content.lower():
+                            triggered = True
+                            break
+
+                    # 4. Check semantics if keywords didn't match
+                    if not triggered and self.config.semantic_reply:
+                        if await self._should_reply_semantically(content, context_history):
+                            triggered = True
+
+                    if not triggered:
+                        # Even if not triggered, update context for future decisions
+                        self._group_context[chat_id].append(f"User: {content}")
+                        if len(self._group_context[chat_id]) > 5:
+                            self._group_context[chat_id].pop(0)
+                        logger.debug("Group message ignored: no mention, reply, keyword, or semantic trigger")
+                        return
+
+                # If triggered or mentioned, update context
+                self._group_context[chat_id].append(f"User: {content}")
+                if len(self._group_context[chat_id]) > 5:
+                    self._group_context[chat_id].pop(0)
+
+                # 5. Apply random chance
+                import random
+                if random.random() > self.config.reply_chance:
+                    return
+
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
             await self._handle_message(
@@ -985,11 +1123,63 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "quoted_content": quoted_content,
                 }
             )
 
         except Exception as e:
             logger.error("Error processing Feishu message: {}", e)
+
+    async def _should_reply_semantically(self, content: str, context: list[str] | None = None) -> bool:
+        """Use the agent's LLM to decide if the bot should reply. Defaults to YES unless specifically excluded."""
+        if not self.provider:
+            return False
+        try:
+            history_str = "\n".join(context) if context else "None"
+            # Inverted logic prompt: Default to YES, look for NO
+            prompt = (
+                "SYSTEM: You are an AI assistant in a group chat. Your goal is to be helpful and engaged.\n"
+                "Respond ONLY with 'YES' or 'NO'. DO NOT use <think> tags.\n\n"
+                "--- CONTEXT (Recent messages) ---\n"
+                "Notes: 'You:' is you. 'User:' is human.\n"
+                f"{history_str}\n"
+                "---------------------------------\n\n"
+                "Current Message: \"" + content + "\"\n\n"
+                "Decision Rules:\n"
+                "1. Default decision is 'YES'. You want to help and answer questions.\n"
+                "2. Respond 'NO' ONLY IF the message is:\n"
+                "   - A casual human-to-human greeting (e.g., 'good morning', 'hi guys') not needing an answer.\n"
+                "   - A private conversation between humans that clearly doesn't involve you.\n"
+                "   - Purely an emoji, a single word like 'ok', 'cool', 'thanks' without a question.\n"
+                "   - Completely irrelevant chatter that an AI would be intrusive to join.\n\n"
+                "Should you respond? (YES/NO):"
+            )
+
+            response = await self.provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=10,
+                temperature=0.0,
+                reasoning_effort=None
+            )
+            raw_content = (response.content or "").strip().upper()
+            thinking = getattr(response, "reasoning_content", "") or ""
+
+            # Extract clean decision
+            clean_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip().upper()
+
+            if not clean_content and "NO" in thinking.upper()[:20]:
+                clean_content = "NO"
+            elif not clean_content:
+                clean_content = "YES" # True default
+
+            logger.debug("Semantic decision for '{}': {} (raw: {})",
+                         content[:30], clean_content, raw_content.replace("\n", " ")[:50])
+
+            # Explicitly only stop if it's a clear 'NO'
+            return "NO" not in clean_content[:10]
+        except Exception as e:
+            logger.warning("Semantic reply check failed: {}", e)
+            return True # Fallback to YES on error to be safe
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""

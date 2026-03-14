@@ -42,11 +42,17 @@ class ChannelManager:
                 continue
             try:
                 cls = load_channel_class(modname)
-                channel = cls(section, self.bus)
+                kwargs = {}
+                if modname == "feishu":
+                    from nanobot.providers.factory import make_provider
+                    kwargs["groq_api_key"] = groq_key
+                    kwargs["provider"] = make_provider(self.config)
+
+                channel = cls(section, self.bus, **kwargs)
                 channel.transcription_api_key = groq_key
                 self.channels[modname] = channel
                 logger.info("{} channel enabled", cls.display_name)
-            except ImportError as e:
+            except (ImportError, Exception) as e:
                 logger.warning("{} channel not available: {}", modname, e)
 
         self._validate_allow_from()

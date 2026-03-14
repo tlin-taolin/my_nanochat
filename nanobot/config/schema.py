@@ -49,6 +49,12 @@ class FeishuConfig(Base):
         "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
     )
     group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned, "open" responds to all
+    # Advanced reply options
+    reply_to_message: bool = True  # If True, bot replies quote the original message
+    reply_all: bool = False  # If True, reply to every message in groups
+    reply_keywords: list[str] = Field(default_factory=list)  # Keywords that trigger a reply without @
+    reply_chance: float = 1.0  # Probability of replying (0.0 to 1.0)
+    semantic_reply: bool = False  # If True, use LLM to decide if it should reply based on context
 
 
 class DingTalkConfig(Base):
